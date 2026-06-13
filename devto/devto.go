@@ -1,52 +1,160 @@
 // Package devto is the library behind the devto command line:
-// the HTTP client, request shaping, and the typed data models for devto.
+// the HTTP client, request shaping, and the typed data models for DEV
+// Community (dev.to).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The API is open and requires no authentication or API key. It is subject to
+// per-IP rate limits; the client paces requests and retries 429/5xx with
+// exponential backoff.
 package devto
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to devto. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+const apiBase = "https://dev.to/api"
+
+// DefaultUserAgent identifies the client to the DEV API.
 const DefaultUserAgent = "devto/dev (+https://github.com/tamnd/devto-cli)"
 
-// Client talks to devto over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+// ErrNotFound is returned when the DEV API reports a 404.
+var ErrNotFound = errors.New("not found")
 
-	last time.Time
+// Config holds constructor parameters for Client.
+type Config struct {
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Workers   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
 		UserAgent: DefaultUserAgent,
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Retries:   3,
+		Workers:   4,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the DEV Community API.
+type Client struct {
+	httpClient *http.Client
+	userAgent  string
+	rate       time.Duration
+	retries    int
+	workers    int
+	mu         sync.Mutex
+	last       time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+		userAgent:  cfg.UserAgent,
+		rate:       cfg.Rate,
+		retries:    cfg.Retries,
+		workers:    cfg.Workers,
+	}
+}
+
+// Articles fetches top articles. top is the number of days (7=week, 30=month,
+// 365=year, 0=all-time). limit caps the number of results (max 1000).
+func (c *Client) Articles(ctx context.Context, top int, limit int) ([]Article, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	params := url.Values{}
+	params.Set("top", strconv.Itoa(top))
+	params.Set("per_page", strconv.Itoa(limit))
+	rawURL := apiBase + "/articles?" + params.Encode()
+	var wire []wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return nil, err
+	}
+	return convertArticles(wire), nil
+}
+
+// TagArticles fetches articles tagged with tag, newest first.
+func (c *Client) TagArticles(ctx context.Context, tag string, limit int) ([]Article, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	params := url.Values{}
+	params.Set("tag", tag)
+	params.Set("per_page", strconv.Itoa(limit))
+	rawURL := apiBase + "/articles?" + params.Encode()
+	var wire []wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return nil, err
+	}
+	return convertArticles(wire), nil
+}
+
+// UserArticles fetches articles published by username, newest first.
+func (c *Client) UserArticles(ctx context.Context, username string, limit int) ([]Article, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	params := url.Values{}
+	params.Set("username", username)
+	params.Set("per_page", strconv.Itoa(limit))
+	rawURL := apiBase + "/articles?" + params.Encode()
+	var wire []wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return nil, err
+	}
+	return convertArticles(wire), nil
+}
+
+// ArticleByID fetches a single article by its integer id.
+func (c *Client) ArticleByID(ctx context.Context, id int) (Article, error) {
+	rawURL := fmt.Sprintf("%s/articles/%d", apiBase, id)
+	var wire wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return Article{}, err
+	}
+	return wireArticleToArticle(wire), nil
+}
+
+// User fetches a user profile by username.
+func (c *Client) User(ctx context.Context, username string) (User, error) {
+	params := url.Values{}
+	params.Set("url", username)
+	rawURL := apiBase + "/users/by_username?" + params.Encode()
+	var wire wireProfile
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return User{}, err
+	}
+	return wireProfileToUser(wire), nil
+}
+
+// ─── HTTP internals ───────────────────────────────────────────────────────────
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -54,7 +162,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -63,18 +171,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -83,26 +192,48 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, ErrNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
+}
+
+func (c *Client) getJSON(ctx context.Context, rawURL string, v any) error {
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return err
+	}
+	// check for DEV API error envelope
+	var errEnv wireError
+	if jsonErr := json.Unmarshal(body, &errEnv); jsonErr == nil && errEnv.Error != "" {
+		if errEnv.Status == http.StatusNotFound {
+			return ErrNotFound
+		}
+		return fmt.Errorf("api error %d: %s", errEnv.Status, errEnv.Error)
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("decode %s: %w", rawURL, err)
+	}
+	return nil
 }
 
 func backoff(attempt int) time.Duration {
@@ -111,4 +242,88 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
+}
+
+func convertArticles(wire []wireArticle) []Article {
+	out := make([]Article, len(wire))
+	for i, w := range wire {
+		out[i] = wireArticleToArticle(w)
+	}
+	return out
+}
+
+// ─── testable helpers (accept a base URL) ─────────────────────────────────────
+
+func (c *Client) articlesWithBase(ctx context.Context, base string, top int, limit int) ([]Article, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	params := url.Values{}
+	params.Set("top", strconv.Itoa(top))
+	params.Set("per_page", strconv.Itoa(limit))
+	rawURL := base + "/articles?" + params.Encode()
+	var wire []wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return nil, err
+	}
+	return convertArticles(wire), nil
+}
+
+func (c *Client) tagArticlesWithBase(ctx context.Context, base string, tag string, limit int) ([]Article, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	params := url.Values{}
+	params.Set("tag", tag)
+	params.Set("per_page", strconv.Itoa(limit))
+	rawURL := base + "/articles?" + params.Encode()
+	var wire []wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return nil, err
+	}
+	return convertArticles(wire), nil
+}
+
+func (c *Client) userArticlesWithBase(ctx context.Context, base string, username string, limit int) ([]Article, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	params := url.Values{}
+	params.Set("username", username)
+	params.Set("per_page", strconv.Itoa(limit))
+	rawURL := base + "/articles?" + params.Encode()
+	var wire []wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return nil, err
+	}
+	return convertArticles(wire), nil
+}
+
+func (c *Client) articleByIDWithBase(ctx context.Context, base string, id int) (Article, error) {
+	rawURL := fmt.Sprintf("%s/articles/%d", base, id)
+	var wire wireArticle
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return Article{}, err
+	}
+	return wireArticleToArticle(wire), nil
+}
+
+func (c *Client) userWithBase(ctx context.Context, base string, username string) (User, error) {
+	params := url.Values{}
+	params.Set("url", username)
+	rawURL := base + "/users/by_username?" + params.Encode()
+	var wire wireProfile
+	if err := c.getJSON(ctx, rawURL, &wire); err != nil {
+		return User{}, err
+	}
+	return wireProfileToUser(wire), nil
 }
