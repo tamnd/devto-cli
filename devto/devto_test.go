@@ -8,17 +8,6 @@ import (
 	"testing"
 )
 
-// newTestClient returns a Client pointed at srv with pacing disabled.
-func newTestClient(srv *httptest.Server) *Client {
-	cfg := DefaultConfig()
-	cfg.Rate = 0
-	cfg.Retries = 2
-	c := NewClient(cfg)
-	// override the base URL via a round-tripper that rewrites the host
-	c.httpClient = srv.Client()
-	return c
-}
-
 // makeArticleJSON returns a JSON array with one article.
 func makeArticleJSON(id int, title, tag, username string) []byte {
 	a := wireArticle{
