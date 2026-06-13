@@ -1,0 +1,10 @@
+title       = "devto"
+baseURL     = "https://devto-cli.tamnd.com/"
+description = "A command line for DEV Community (dev.to)."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/devto-cli"
