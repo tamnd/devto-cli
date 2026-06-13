@@ -43,14 +43,14 @@ func codeError(code int, err error) error { return &ExitError{Code: code, Err: e
 
 // App holds shared state threaded through every command.
 type App struct {
-	client  *devto.Client
-	cfg     devto.Config
-	output  string
-	fields  []string
+	client   *devto.Client
+	cfg      devto.Config
+	output   string
+	fields   []string
 	noHeader bool
 	template string
-	limit   int
-	quiet   bool
+	limit    int
+	quiet    bool
 }
 
 // Root builds the root command and its subtree.

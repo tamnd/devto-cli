@@ -271,7 +271,6 @@ func TestRetryOn429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-
 	cfg := DefaultConfig()
 	cfg.Rate = 0
 	cfg.Retries = 3
