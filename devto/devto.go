@@ -1,62 +1,52 @@
-// Package devto is the library behind the devto command line:
-// the HTTP client, request shaping, and the typed data models for devto.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package devto
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to devto. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "devto/dev (+https://github.com/tamnd/devto-cli)"
+const Host = "dev.to"
+const baseURL = "https://dev.to/api"
+const DefaultUserAgent = "Mozilla/5.0 (compatible; devto-cli/0.1; +https://github.com/tamnd/devto-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at devto.com; change it once you
-// know the real endpoints you want to read.
-const Host = "devto.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to devto over HTTP.
-type Client struct {
-	HTTP      *http.Client
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      time.Second,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+func NewClient() *Client { return NewClientWithConfig(DefaultConfig()) }
+
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout}}
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +54,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +63,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -96,20 +87,15 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
 	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return b, err != nil, err
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +109,100 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on devto.com. It is a stand-in for the typed records you
-// will model from the real devto endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `devto cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// wireUser is the nested user object in article responses.
+type wireUser struct {
+	Username string `json:"username"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// wireArticle is the raw API response for a DEV.to article.
+type wireArticle struct {
+	ID                   int      `json:"id"`
+	Title                string   `json:"title"`
+	URL                  string   `json:"url"`
+	PublicReactionsCount int      `json:"public_reactions_count"`
+	CommentsCount        int      `json:"comments_count"`
+	TagList              []string `json:"tag_list"`
+	User                 wireUser `json:"user"`
+}
+
+// Article is one DEV.to article.
+type Article struct {
+	ID        string   `json:"id"        kit:"id" table:"id"`
+	Title     string   `json:"title"              table:"title"`
+	Author    string   `json:"author"             table:"author"`
+	Reactions int      `json:"reactions"          table:"reactions"`
+	Comments  int      `json:"comments"           table:"comments"`
+	Tags      []string `json:"tags"               table:"tags"`
+	URL       string   `json:"url"                table:"url,url"`
+}
+
+func fromWire(w wireArticle) *Article {
+	return &Article{
+		ID:        fmt.Sprintf("%d", w.ID),
+		Title:     w.Title,
+		Author:    w.User.Username,
+		Reactions: w.PublicReactionsCount,
+		Comments:  w.CommentsCount,
+		Tags:      w.TagList,
+		URL:       w.URL,
+	}
+}
+
+func (c *Client) fetchArticles(ctx context.Context, endpoint string, limit int) ([]*Article, error) {
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = baseURL
+	}
+	body, err := c.get(ctx, base+endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	var raw []wireArticle
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	articles := make([]*Article, 0, len(raw))
+	for _, w := range raw {
+		articles = append(articles, fromWire(w))
+	}
+	if limit > 0 && len(articles) > limit {
+		articles = articles[:limit]
+	}
+	return articles, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+// Top returns the top DEV.to articles.
+func (c *Client) Top(ctx context.Context, limit int) ([]*Article, error) {
+	q := url.Values{}
+	q.Set("top", "1")
+	if limit > 0 {
+		q.Set("per_page", fmt.Sprintf("%d", limit))
+	} else {
+		q.Set("per_page", "20")
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
+	return c.fetchArticles(ctx, "/articles?"+q.Encode(), 0)
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// ByTag returns DEV.to articles for a tag.
+func (c *Client) ByTag(ctx context.Context, tag string, limit int) ([]*Article, error) {
+	q := url.Values{}
+	q.Set("tag", tag)
+	if limit > 0 {
+		q.Set("per_page", fmt.Sprintf("%d", limit))
+	} else {
+		q.Set("per_page", "20")
 	}
-	return out
+	return c.fetchArticles(ctx, "/articles?"+q.Encode(), 0)
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// ByUser returns DEV.to articles by a user.
+func (c *Client) ByUser(ctx context.Context, username string, limit int) ([]*Article, error) {
+	q := url.Values{}
+	q.Set("username", username)
+	if limit > 0 {
+		q.Set("per_page", fmt.Sprintf("%d", limit))
+	} else {
+		q.Set("per_page", "20")
 	}
-	return s
+	return c.fetchArticles(ctx, "/articles?"+q.Encode(), 0)
 }
